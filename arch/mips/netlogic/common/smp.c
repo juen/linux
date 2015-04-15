@@ -135,10 +135,6 @@ void nlm_smp_finish(void)
 	local_irq_enable();
 }
 
-void nlm_cpus_done(void)
-{
-}
-
 /*
  * Boot all other cpus in the system, initialize them, and bring them into
  * the boot function
@@ -166,7 +162,6 @@ void __init nlm_smp_setup(void)
 	unsigned int boot_cpu;
 	int num_cpus, i, ncore, node;
 	volatile u32 *cpu_ready = nlm_get_boot_data(BOOT_CPU_READY);
-	char buf[64];
 
 	boot_cpu = hard_smp_processor_id();
 	cpumask_clear(&phys_cpu_present_mask);
@@ -193,12 +188,12 @@ void __init nlm_smp_setup(void)
 		}
 	}
 
-	cpumask_scnprintf(buf, ARRAY_SIZE(buf), &phys_cpu_present_mask);
-	pr_info("Physical CPU mask: %s\n", buf);
-	cpumask_scnprintf(buf, ARRAY_SIZE(buf), cpu_possible_mask);
-	pr_info("Possible CPU mask: %s\n", buf);
+	pr_info("Physical CPU mask: %*pb\n",
+		cpumask_pr_args(&phys_cpu_present_mask));
+	pr_info("Possible CPU mask: %*pb\n",
+		cpumask_pr_args(cpu_possible_mask));
 
-	/* check with the cores we have worken up */
+	/* check with the cores we have woken up */
 	for (ncore = 0, i = 0; i < NLM_NR_NODES; i++)
 		ncore += hweight32(nlm_get_node(i)->coremask);
 
@@ -247,8 +242,7 @@ static int nlm_parse_cpumask(cpumask_t *wakeup_mask)
 	return threadmode;
 
 unsupp:
-	panic("Unsupported CPU mask %lx",
-		(unsigned long)cpumask_bits(wakeup_mask)[0]);
+	panic("Unsupported CPU mask %*pb", cpumask_pr_args(wakeup_mask));
 	return 0;
 }
 
@@ -277,7 +271,6 @@ struct plat_smp_ops nlm_smp_ops = {
 	.send_ipi_mask		= nlm_send_ipi_mask,
 	.init_secondary		= nlm_init_secondary,
 	.smp_finish		= nlm_smp_finish,
-	.cpus_done		= nlm_cpus_done,
 	.boot_secondary		= nlm_boot_secondary,
 	.smp_setup		= nlm_smp_setup,
 	.prepare_cpus		= nlm_prepare_cpus,

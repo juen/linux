@@ -24,6 +24,12 @@
 #define RPC_MAX_SLOT_TABLE_LIMIT	(65536U)
 #define RPC_MAX_SLOT_TABLE	RPC_MAX_SLOT_TABLE_LIMIT
 
+#define RPC_CWNDSHIFT		(8U)
+#define RPC_CWNDSCALE		(1U << RPC_CWNDSHIFT)
+#define RPC_INITCWND		RPC_CWNDSCALE
+#define RPC_MAXCWND(xprt)	((xprt)->max_reqs << RPC_CWNDSHIFT)
+#define RPCXPRT_CONGESTED(xprt) ((xprt)->cong >= (xprt)->cwnd)
+
 /*
  * This describes a timeout strategy
  */
@@ -233,6 +239,9 @@ struct rpc_xprt {
 	struct net		*xprt_net;
 	const char		*servername;
 	const char		*address_strings[RPC_DISPLAY_MAX];
+#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
+	struct dentry		*debugfs;		/* debugfs directory */
+#endif
 };
 
 #if defined(CONFIG_SUNRPC_BACKCHANNEL)
@@ -338,6 +347,9 @@ void			xprt_force_disconnect(struct rpc_xprt *xprt);
 void			xprt_conditional_disconnect(struct rpc_xprt *xprt, unsigned int cookie);
 int			xs_swapper(struct rpc_xprt *xprt, int enable);
 
+bool			xprt_lock_connect(struct rpc_xprt *, struct rpc_task *, void *);
+void			xprt_unlock_connect(struct rpc_xprt *, void *);
+
 /*
  * Reserved bit positions in xprt->state
  */
@@ -348,8 +360,6 @@ int			xs_swapper(struct rpc_xprt *xprt, int enable);
 #define XPRT_BOUND		(4)
 #define XPRT_BINDING		(5)
 #define XPRT_CLOSING		(6)
-#define XPRT_CONNECTION_ABORT	(7)
-#define XPRT_CONNECTION_CLOSE	(8)
 #define XPRT_CONGESTED		(9)
 
 static inline void xprt_set_connected(struct rpc_xprt *xprt)

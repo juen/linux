@@ -89,7 +89,7 @@ char *tomoyo_encode(const char *str)
  *
  * If dentry is a directory, trailing '/' is appended.
  */
-static char *tomoyo_get_absolute_path(struct path *path, char * const buffer,
+static char *tomoyo_get_absolute_path(const struct path *path, char * const buffer,
 				      const int buflen)
 {
 	char *pos = ERR_PTR(-ENOMEM);
@@ -173,7 +173,7 @@ static char *tomoyo_get_local_path(struct dentry *dentry, char * const buffer,
 		 * Use filesystem name if filesystem does not support rename()
 		 * operation.
 		 */
-		if (!inode->i_op->rename)
+		if (!inode->i_op->rename && !inode->i_op->rename2)
 			goto prepend_filesystem_name;
 	}
 	/* Prepend device name. */
@@ -216,7 +216,7 @@ out:
  *
  * Returns the buffer.
  */
-static char *tomoyo_get_socket_name(struct path *path, char * const buffer,
+static char *tomoyo_get_socket_name(const struct path *path, char * const buffer,
 				    const int buflen)
 {
 	struct inode *inode = path->dentry->d_inode;
@@ -247,7 +247,7 @@ static char *tomoyo_get_socket_name(struct path *path, char * const buffer,
  * These functions use kzalloc(), so the caller must call kfree()
  * if these functions didn't return NULL.
  */
-char *tomoyo_realpath_from_path(struct path *path)
+char *tomoyo_realpath_from_path(const struct path *path)
 {
 	char *buf = NULL;
 	char *name = NULL;
@@ -282,7 +282,8 @@ char *tomoyo_realpath_from_path(struct path *path)
 		 * Get local name for filesystems without rename() operation
 		 * or dentry without vfsmount.
 		 */
-		if (!path->mnt || !inode->i_op->rename)
+		if (!path->mnt ||
+		    (!inode->i_op->rename && !inode->i_op->rename2))
 			pos = tomoyo_get_local_path(path->dentry, buf,
 						    buf_len - 1);
 		/* Get absolute name for the rest. */

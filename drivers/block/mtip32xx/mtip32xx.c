@@ -39,6 +39,7 @@
 #include <../drivers/ata/ahci.h>
 #include <linux/export.h>
 #include <linux/debugfs.h>
+#include <linux/prefetch.h>
 #include "mtip32xx.h"
 
 #define HW_CMD_SLOT_SZ		(MTIP_MAX_COMMAND_SLOTS * 32)
@@ -246,7 +247,7 @@ static void mtip_async_complete(struct mtip_port *port,
 	if (unlikely(cmd->unaligned))
 		up(&port->cmd_slot_unal);
 
-	blk_mq_end_io(rq, status ? -EIO : 0);
+	blk_mq_end_request(rq, status ? -EIO : 0);
 }
 
 /*
@@ -2380,6 +2381,8 @@ static void mtip_hw_submit_io(struct driver_data *dd, struct request *rq,
 	/* Map the scatter list for DMA access */
 	nents = dma_map_sg(&dd->pdev->dev, command->sg, nents, dma_dir);
 
+	prefetch(&port->flags);
+
 	command->scatter_ents = nents;
 
 	/*
@@ -2392,7 +2395,7 @@ static void mtip_hw_submit_io(struct driver_data *dd, struct request *rq,
 	fis = command->command;
 	fis->type        = 0x27;
 	fis->opts        = 1 << 7;
-	if (rq_data_dir(rq) == READ)
+	if (dma_dir == DMA_FROM_DEVICE)
 		fis->command = ATA_CMD_FPDMA_READ;
 	else
 		fis->command = ATA_CMD_FPDMA_WRITE;
@@ -2412,7 +2415,7 @@ static void mtip_hw_submit_io(struct driver_data *dd, struct request *rq,
 	fis->res3        = 0;
 	fill_command_sg(dd, command, nents);
 
-	if (command->unaligned)
+	if (unlikely(command->unaligned))
 		fis->device |= 1 << 7;
 
 	/* Populate the command header */
@@ -2433,7 +2436,7 @@ static void mtip_hw_submit_io(struct driver_data *dd, struct request *rq,
 	 * To prevent this command from being issued
 	 * if an internal command is in progress or error handling is active.
 	 */
-	if (port->flags & MTIP_PF_PAUSE_IO) {
+	if (unlikely(port->flags & MTIP_PF_PAUSE_IO)) {
 		set_bit(rq->tag, port->cmds_to_issue);
 		set_bit(MTIP_PF_ISSUE_CMDS_BIT, &port->flags);
 		return;
@@ -3736,7 +3739,7 @@ static int mtip_submit_request(struct blk_mq_hw_ctx *hctx, struct request *rq)
 		int err;
 
 		err = mtip_send_trim(dd, blk_rq_pos(rq), blk_rq_sectors(rq));
-		blk_mq_end_io(rq, err);
+		blk_mq_end_request(rq, err);
 		return 0;
 	}
 
@@ -3754,7 +3757,7 @@ static bool mtip_check_unal_depth(struct blk_mq_hw_ctx *hctx,
 	struct driver_data *dd = hctx->queue->queuedata;
 	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
 
-	if (!dd->unal_qdepth || rq_data_dir(rq) == READ)
+	if (rq_data_dir(rq) == READ || !dd->unal_qdepth)
 		return false;
 
 	/*
@@ -3772,15 +3775,19 @@ static bool mtip_check_unal_depth(struct blk_mq_hw_ctx *hctx,
 	return false;
 }
 
-static int mtip_queue_rq(struct blk_mq_hw_ctx *hctx, struct request *rq)
+static int mtip_queue_rq(struct blk_mq_hw_ctx *hctx,
+			 const struct blk_mq_queue_data *bd)
 {
+	struct request *rq = bd->rq;
 	int ret;
 
-	if (mtip_check_unal_depth(hctx, rq))
+	if (unlikely(mtip_check_unal_depth(hctx, rq)))
 		return BLK_MQ_RQ_QUEUE_BUSY;
 
+	blk_mq_start_request(rq);
+
 	ret = mtip_submit_request(hctx, rq);
-	if (!ret)
+	if (likely(!ret))
 		return BLK_MQ_RQ_QUEUE_OK;
 
 	rq->errors = ret;
@@ -3915,7 +3922,6 @@ skip_create_disk:
 	if (rv) {
 		dev_err(&dd->pdev->dev,
 			"Unable to allocate request queue\n");
-		rv = -ENOMEM;
 		goto block_queue_alloc_init_error;
 	}
 
@@ -3949,6 +3955,7 @@ skip_create_disk:
 
 	/* Set device limits. */
 	set_bit(QUEUE_FLAG_NONROT, &dd->queue->queue_flags);
+	clear_bit(QUEUE_FLAG_ADD_RANDOM, &dd->queue->queue_flags);
 	blk_queue_max_segments(dd->queue, MTIP_MAX_SG);
 	blk_queue_physical_block_size(dd->queue, 4096);
 	blk_queue_max_hw_sectors(dd->queue, 0xffff);
@@ -4629,7 +4636,7 @@ static void mtip_pci_shutdown(struct pci_dev *pdev)
 }
 
 /* Table of device ids supported by this driver. */
-static DEFINE_PCI_DEVICE_TABLE(mtip_pci_tbl) = {
+static const struct pci_device_id mtip_pci_tbl[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_MICRON, P320H_DEVICE_ID) },
 	{ PCI_DEVICE(PCI_VENDOR_ID_MICRON, P320M_DEVICE_ID) },
 	{ PCI_DEVICE(PCI_VENDOR_ID_MICRON, P320S_DEVICE_ID) },

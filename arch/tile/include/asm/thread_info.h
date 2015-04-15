@@ -36,7 +36,6 @@ struct thread_info {
 
 	mm_segment_t		addr_limit;	/* thread address space
 						   (KERNEL_DS or USER_DS) */
-	struct restart_block	restart_block;
 	struct single_step_state *step_state;	/* single step state
 						   (if non-zero) */
 	int			align_ctl;	/* controls unaligned access */
@@ -57,9 +56,6 @@ struct thread_info {
 	.cpu		= 0,			\
 	.preempt_count	= INIT_PREEMPT_COUNT,	\
 	.addr_limit	= KERNEL_DS,		\
-	.restart_block	= {			\
-		.fn = do_no_restart_syscall,	\
-	},					\
 	.step_state	= NULL,			\
 	.align_ctl	= 0,			\
 }
@@ -94,7 +90,7 @@ register unsigned long stack_pointer __asm__("sp");
 /* Sit on a nap instruction until interrupted. */
 extern void smp_nap(void);
 
-/* Enable interrupts racelessly and nap forever: helper for cpu_idle(). */
+/* Enable interrupts racelessly and nap forever: helper for arch_cpu_idle(). */
 extern void _cpu_idle(void);
 
 #else /* __ASSEMBLY__ */

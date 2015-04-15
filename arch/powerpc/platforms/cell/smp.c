@@ -40,6 +40,7 @@
 #include <asm/firmware.h>
 #include <asm/rtas.h>
 #include <asm/cputhreads.h>
+#include <asm/code-patching.h>
 
 #include "interrupt.h"
 #include <asm/udbg.h>
@@ -70,8 +71,8 @@ static cpumask_t of_spin_map;
 static inline int smp_startup_cpu(unsigned int lcpu)
 {
 	int status;
-	unsigned long start_here = __pa((u32)*((unsigned long *)
-					       generic_secondary_smp_init));
+	unsigned long start_here =
+			__pa(ppc_function_entry(generic_secondary_smp_init));
 	unsigned int pcpu;
 	int start_cpu;
 
@@ -105,7 +106,7 @@ static int __init smp_iic_probe(void)
 {
 	iic_request_IPIs();
 
-	return cpumask_weight(cpu_possible_mask);
+	return num_possible_cpus();
 }
 
 static void smp_cell_setup_cpu(int cpu)

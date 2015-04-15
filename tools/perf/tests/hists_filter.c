@@ -21,33 +21,33 @@ struct sample {
 /* For the numbers, see hists_common.c */
 static struct sample fake_samples[] = {
 	/* perf [kernel] schedule() */
-	{ .pid = 100, .ip = 0xf0000 + 700, },
+	{ .pid = FAKE_PID_PERF1, .ip = FAKE_IP_KERNEL_SCHEDULE, },
 	/* perf [perf]   main() */
-	{ .pid = 100, .ip = 0x40000 + 700, },
+	{ .pid = FAKE_PID_PERF1, .ip = FAKE_IP_PERF_MAIN, },
 	/* perf [libc]   malloc() */
-	{ .pid = 100, .ip = 0x50000 + 700, },
+	{ .pid = FAKE_PID_PERF1, .ip = FAKE_IP_LIBC_MALLOC, },
 	/* perf [perf]   main() */
-	{ .pid = 200, .ip = 0x40000 + 700, }, /* will be merged */
+	{ .pid = FAKE_PID_PERF2, .ip = FAKE_IP_PERF_MAIN, }, /* will be merged */
 	/* perf [perf]   cmd_record() */
-	{ .pid = 200, .ip = 0x40000 + 900, },
+	{ .pid = FAKE_PID_PERF2, .ip = FAKE_IP_PERF_CMD_RECORD, },
 	/* perf [kernel] page_fault() */
-	{ .pid = 200, .ip = 0xf0000 + 800, },
+	{ .pid = FAKE_PID_PERF2, .ip = FAKE_IP_KERNEL_PAGE_FAULT, },
 	/* bash [bash]   main() */
-	{ .pid = 300, .ip = 0x40000 + 700, },
+	{ .pid = FAKE_PID_BASH,  .ip = FAKE_IP_BASH_MAIN, },
 	/* bash [bash]   xmalloc() */
-	{ .pid = 300, .ip = 0x40000 + 800, },
+	{ .pid = FAKE_PID_BASH,  .ip = FAKE_IP_BASH_XMALLOC, },
 	/* bash [libc]   malloc() */
-	{ .pid = 300, .ip = 0x50000 + 700, },
+	{ .pid = FAKE_PID_BASH,  .ip = FAKE_IP_LIBC_MALLOC, },
 	/* bash [kernel] page_fault() */
-	{ .pid = 300, .ip = 0xf0000 + 800, },
+	{ .pid = FAKE_PID_BASH,  .ip = FAKE_IP_KERNEL_PAGE_FAULT, },
 };
 
-static int add_hist_entries(struct perf_evlist *evlist, struct machine *machine)
+static int add_hist_entries(struct perf_evlist *evlist,
+			    struct machine *machine)
 {
 	struct perf_evsel *evsel;
 	struct addr_location al;
-	struct hist_entry *he;
-	struct perf_sample sample = { .cpu = 0, };
+	struct perf_sample sample = { .period = 100, };
 	size_t i;
 
 	/*
@@ -62,11 +62,16 @@ static int add_hist_entries(struct perf_evlist *evlist, struct machine *machine)
 					.misc = PERF_RECORD_MISC_USER,
 				},
 			};
+			struct hist_entry_iter iter = {
+				.ops = &hist_iter_normal,
+				.hide_unresolved = false,
+			};
+			struct hists *hists = evsel__hists(evsel);
 
 			/* make sure it has no filter at first */
-			evsel->hists.thread_filter = NULL;
-			evsel->hists.dso_filter = NULL;
-			evsel->hists.symbol_filter_str = NULL;
+			hists->thread_filter = NULL;
+			hists->dso_filter = NULL;
+			hists->symbol_filter_str = NULL;
 
 			sample.pid = fake_samples[i].pid;
 			sample.tid = fake_samples[i].pid;
@@ -76,18 +81,13 @@ static int add_hist_entries(struct perf_evlist *evlist, struct machine *machine)
 							  &sample) < 0)
 				goto out;
 
-			he = __hists__add_entry(&evsel->hists, &al, NULL,
-						NULL, NULL, 100, 1, 0);
-			if (he == NULL)
+			if (hist_entry_iter__add(&iter, &al, evsel, &sample,
+						 PERF_MAX_STACK_DEPTH, NULL) < 0)
 				goto out;
 
 			fake_samples[i].thread = al.thread;
 			fake_samples[i].map = al.map;
 			fake_samples[i].sym = al.sym;
-
-			hists__inc_nr_events(he->hists, PERF_RECORD_SAMPLE);
-			if (!he->filtered)
-				he->hists->stats.nr_non_filtered_samples++;
 		}
 	}
 
@@ -135,10 +135,10 @@ int test__hists_filter(void)
 		goto out;
 
 	evlist__for_each(evlist, evsel) {
-		struct hists *hists = &evsel->hists;
+		struct hists *hists = evsel__hists(evsel);
 
 		hists__collapse_resort(hists, NULL);
-		hists__output_resort(hists);
+		hists__output_resort(hists, NULL);
 
 		if (verbose > 2) {
 			pr_info("Normal histogram\n");
@@ -161,7 +161,7 @@ int test__hists_filter(void)
 				hists->stats.total_non_filtered_period);
 
 		/* now applying thread filter for 'bash' */
-		evsel->hists.thread_filter = fake_samples[9].thread;
+		hists->thread_filter = fake_samples[9].thread;
 		hists__filter_by_thread(hists);
 
 		if (verbose > 2) {
@@ -186,11 +186,11 @@ int test__hists_filter(void)
 				hists->stats.total_non_filtered_period == 400);
 
 		/* remove thread filter first */
-		evsel->hists.thread_filter = NULL;
+		hists->thread_filter = NULL;
 		hists__filter_by_thread(hists);
 
 		/* now applying dso filter for 'kernel' */
-		evsel->hists.dso_filter = fake_samples[0].map->dso;
+		hists->dso_filter = fake_samples[0].map->dso;
 		hists__filter_by_dso(hists);
 
 		if (verbose > 2) {
@@ -215,7 +215,7 @@ int test__hists_filter(void)
 				hists->stats.total_non_filtered_period == 300);
 
 		/* remove dso filter first */
-		evsel->hists.dso_filter = NULL;
+		hists->dso_filter = NULL;
 		hists__filter_by_dso(hists);
 
 		/*
@@ -225,7 +225,7 @@ int test__hists_filter(void)
 		 * be counted as a separate entry but the sample count and
 		 * total period will be remained.
 		 */
-		evsel->hists.symbol_filter_str = "main";
+		hists->symbol_filter_str = "main";
 		hists__filter_by_symbol(hists);
 
 		if (verbose > 2) {
@@ -250,8 +250,8 @@ int test__hists_filter(void)
 				hists->stats.total_non_filtered_period == 300);
 
 		/* now applying all filters at once. */
-		evsel->hists.thread_filter = fake_samples[1].thread;
-		evsel->hists.dso_filter = fake_samples[1].map->dso;
+		hists->thread_filter = fake_samples[1].thread;
+		hists->dso_filter = fake_samples[1].map->dso;
 		hists__filter_by_thread(hists);
 		hists__filter_by_dso(hists);
 

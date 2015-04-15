@@ -8,19 +8,19 @@
 
 /*
  * Fireworks have its own transaction. The transaction can be delivered by AV/C
- * Vendor Specific command. But at least Windows driver and firmware version 5.5
- * or later don't use it.
+ * Vendor Specific command frame or usual asynchronous transaction. At least,
+ * Windows driver and firmware version 5.5 or later don't use AV/C command.
  *
  * Transaction substance:
- *  At first, 6 data exist. Following to the 6 data, parameters for each
- *  commands exists. All of parameters are 32 bit alighed to big endian.
+ *  At first, 6 data exist. Following to the data, parameters for each command
+ *  exist. All of the parameters are 32 bit alighed to big endian.
  *   data[0]:	Length of transaction substance
  *   data[1]:	Transaction version
  *   data[2]:	Sequence number. This is incremented by the device
- *   data[3]:	transaction category
- *   data[4]:	transaction command
- *   data[5]:	return value in response.
- *   data[6-]:	parameters
+ *   data[3]:	Transaction category
+ *   data[4]:	Transaction command
+ *   data[5]:	Return value in response.
+ *   data[6-]:	Parameters
  *
  * Transaction address:
  *  command:	0xecc000000000
@@ -124,7 +124,7 @@ copy_resp_to_buf(struct snd_efw *efw, void *data, size_t length, int *rcode)
 	spin_lock_irq(&efw->lock);
 
 	t = (struct snd_efw_transaction *)data;
-	length = min_t(size_t, t->length * sizeof(t->length), length);
+	length = min_t(size_t, be32_to_cpu(t->length) * sizeof(u32), length);
 
 	if (efw->push_ptr < efw->pull_ptr)
 		capacity = (unsigned int)(efw->pull_ptr - efw->push_ptr);
@@ -148,7 +148,7 @@ copy_resp_to_buf(struct snd_efw *efw, void *data, size_t length, int *rcode)
 
 		efw->push_ptr += till_end;
 		if (efw->push_ptr >= efw->resp_buf + snd_efw_resp_buf_size)
-			efw->push_ptr = efw->resp_buf;
+			efw->push_ptr -= snd_efw_resp_buf_size;
 
 		length -= till_end;
 		data += till_end;

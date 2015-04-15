@@ -22,31 +22,31 @@ struct sample {
 /* For the numbers, see hists_common.c */
 static struct sample fake_samples[] = {
 	/* perf [kernel] schedule() */
-	{ .cpu = 0, .pid = 100, .ip = 0xf0000 + 700, },
+	{ .cpu = 0, .pid = FAKE_PID_PERF1, .ip = FAKE_IP_KERNEL_SCHEDULE, },
 	/* perf [perf]   main() */
-	{ .cpu = 1, .pid = 100, .ip = 0x40000 + 700, },
+	{ .cpu = 1, .pid = FAKE_PID_PERF1, .ip = FAKE_IP_PERF_MAIN, },
 	/* perf [perf]   cmd_record() */
-	{ .cpu = 1, .pid = 100, .ip = 0x40000 + 900, },
+	{ .cpu = 1, .pid = FAKE_PID_PERF1, .ip = FAKE_IP_PERF_CMD_RECORD, },
 	/* perf [libc]   malloc() */
-	{ .cpu = 1, .pid = 100, .ip = 0x50000 + 700, },
+	{ .cpu = 1, .pid = FAKE_PID_PERF1, .ip = FAKE_IP_LIBC_MALLOC, },
 	/* perf [libc]   free() */
-	{ .cpu = 2, .pid = 100, .ip = 0x50000 + 800, },
+	{ .cpu = 2, .pid = FAKE_PID_PERF1, .ip = FAKE_IP_LIBC_FREE, },
 	/* perf [perf]   main() */
-	{ .cpu = 2, .pid = 200, .ip = 0x40000 + 700, },
+	{ .cpu = 2, .pid = FAKE_PID_PERF2, .ip = FAKE_IP_PERF_MAIN, },
 	/* perf [kernel] page_fault() */
-	{ .cpu = 2, .pid = 200, .ip = 0xf0000 + 800, },
+	{ .cpu = 2, .pid = FAKE_PID_PERF2, .ip = FAKE_IP_KERNEL_PAGE_FAULT, },
 	/* bash [bash]   main() */
-	{ .cpu = 3, .pid = 300, .ip = 0x40000 + 700, },
+	{ .cpu = 3, .pid = FAKE_PID_BASH,  .ip = FAKE_IP_BASH_MAIN, },
 	/* bash [bash]   xmalloc() */
-	{ .cpu = 0, .pid = 300, .ip = 0x40000 + 800, },
+	{ .cpu = 0, .pid = FAKE_PID_BASH,  .ip = FAKE_IP_BASH_XMALLOC, },
 	/* bash [kernel] page_fault() */
-	{ .cpu = 1, .pid = 300, .ip = 0xf0000 + 800, },
+	{ .cpu = 1, .pid = FAKE_PID_BASH,  .ip = FAKE_IP_KERNEL_PAGE_FAULT, },
 };
 
 static int add_hist_entries(struct hists *hists, struct machine *machine)
 {
 	struct addr_location al;
-	struct hist_entry *he;
+	struct perf_evsel *evsel = hists_to_evsel(hists);
 	struct perf_sample sample = { .period = 100, };
 	size_t i;
 
@@ -55,6 +55,10 @@ static int add_hist_entries(struct hists *hists, struct machine *machine)
 			.header = {
 				.misc = PERF_RECORD_MISC_USER,
 			},
+		};
+		struct hist_entry_iter iter = {
+			.ops = &hist_iter_normal,
+			.hide_unresolved = false,
 		};
 
 		sample.cpu = fake_samples[i].cpu;
@@ -66,9 +70,8 @@ static int add_hist_entries(struct hists *hists, struct machine *machine)
 						  &sample) < 0)
 			goto out;
 
-		he = __hists__add_entry(hists, &al, NULL, NULL, NULL,
-					sample.period, 1, 0);
-		if (he == NULL)
+		if (hist_entry_iter__add(&iter, &al, evsel, &sample,
+					 PERF_MAX_STACK_DEPTH, NULL) < 0)
 			goto out;
 
 		fake_samples[i].thread = al.thread;
@@ -103,7 +106,7 @@ static void del_hist_entries(struct hists *hists)
 		he = rb_entry(node, struct hist_entry, rb_node);
 		rb_erase(node, root_out);
 		rb_erase(&he->rb_node_in, root_in);
-		hist_entry__free(he);
+		hist_entry__delete(he);
 	}
 }
 
@@ -119,7 +122,7 @@ typedef int (*test_fn_t)(struct perf_evsel *, struct machine *);
 static int test1(struct perf_evsel *evsel, struct machine *machine)
 {
 	int err;
-	struct hists *hists = &evsel->hists;
+	struct hists *hists = evsel__hists(evsel);
 	struct hist_entry *he;
 	struct rb_root *root;
 	struct rb_node *node;
@@ -149,14 +152,14 @@ static int test1(struct perf_evsel *evsel, struct machine *machine)
 		goto out;
 
 	hists__collapse_resort(hists, NULL);
-	hists__output_resort(hists);
+	hists__output_resort(hists, NULL);
 
 	if (verbose > 2) {
 		pr_info("[fields = %s, sort = %s]\n", field_order, sort_order);
 		print_hists_out(hists);
 	}
 
-	root = &evsel->hists.entries;
+	root = &hists->entries;
 	node = rb_first(root);
 	he = rb_entry(node, struct hist_entry, rb_node);
 	TEST_ASSERT_VAL("Invalid hist entry",
@@ -221,7 +224,7 @@ out:
 static int test2(struct perf_evsel *evsel, struct machine *machine)
 {
 	int err;
-	struct hists *hists = &evsel->hists;
+	struct hists *hists = evsel__hists(evsel);
 	struct hist_entry *he;
 	struct rb_root *root;
 	struct rb_node *node;
@@ -249,14 +252,14 @@ static int test2(struct perf_evsel *evsel, struct machine *machine)
 		goto out;
 
 	hists__collapse_resort(hists, NULL);
-	hists__output_resort(hists);
+	hists__output_resort(hists, NULL);
 
 	if (verbose > 2) {
 		pr_info("[fields = %s, sort = %s]\n", field_order, sort_order);
 		print_hists_out(hists);
 	}
 
-	root = &evsel->hists.entries;
+	root = &hists->entries;
 	node = rb_first(root);
 	he = rb_entry(node, struct hist_entry, rb_node);
 	TEST_ASSERT_VAL("Invalid hist entry",
@@ -277,7 +280,7 @@ out:
 static int test3(struct perf_evsel *evsel, struct machine *machine)
 {
 	int err;
-	struct hists *hists = &evsel->hists;
+	struct hists *hists = evsel__hists(evsel);
 	struct hist_entry *he;
 	struct rb_root *root;
 	struct rb_node *node;
@@ -303,14 +306,14 @@ static int test3(struct perf_evsel *evsel, struct machine *machine)
 		goto out;
 
 	hists__collapse_resort(hists, NULL);
-	hists__output_resort(hists);
+	hists__output_resort(hists, NULL);
 
 	if (verbose > 2) {
 		pr_info("[fields = %s, sort = %s]\n", field_order, sort_order);
 		print_hists_out(hists);
 	}
 
-	root = &evsel->hists.entries;
+	root = &hists->entries;
 	node = rb_first(root);
 	he = rb_entry(node, struct hist_entry, rb_node);
 	TEST_ASSERT_VAL("Invalid hist entry",
@@ -351,7 +354,7 @@ out:
 static int test4(struct perf_evsel *evsel, struct machine *machine)
 {
 	int err;
-	struct hists *hists = &evsel->hists;
+	struct hists *hists = evsel__hists(evsel);
 	struct hist_entry *he;
 	struct rb_root *root;
 	struct rb_node *node;
@@ -381,14 +384,14 @@ static int test4(struct perf_evsel *evsel, struct machine *machine)
 		goto out;
 
 	hists__collapse_resort(hists, NULL);
-	hists__output_resort(hists);
+	hists__output_resort(hists, NULL);
 
 	if (verbose > 2) {
 		pr_info("[fields = %s, sort = %s]\n", field_order, sort_order);
 		print_hists_out(hists);
 	}
 
-	root = &evsel->hists.entries;
+	root = &hists->entries;
 	node = rb_first(root);
 	he = rb_entry(node, struct hist_entry, rb_node);
 	TEST_ASSERT_VAL("Invalid hist entry",
@@ -453,7 +456,7 @@ out:
 static int test5(struct perf_evsel *evsel, struct machine *machine)
 {
 	int err;
-	struct hists *hists = &evsel->hists;
+	struct hists *hists = evsel__hists(evsel);
 	struct hist_entry *he;
 	struct rb_root *root;
 	struct rb_node *node;
@@ -484,14 +487,14 @@ static int test5(struct perf_evsel *evsel, struct machine *machine)
 		goto out;
 
 	hists__collapse_resort(hists, NULL);
-	hists__output_resort(hists);
+	hists__output_resort(hists, NULL);
 
 	if (verbose > 2) {
 		pr_info("[fields = %s, sort = %s]\n", field_order, sort_order);
 		print_hists_out(hists);
 	}
 
-	root = &evsel->hists.entries;
+	root = &hists->entries;
 	node = rb_first(root);
 	he = rb_entry(node, struct hist_entry, rb_node);
 

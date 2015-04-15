@@ -37,6 +37,9 @@
 #include "target_core_alua.h"
 
 static sense_reason_t
+sbc_check_prot(struct se_device *, struct se_cmd *, unsigned char *, u32, bool);
+
+static sense_reason_t
 sbc_emulate_readcapacity(struct se_cmd *cmd)
 {
 	struct se_device *dev = cmd->se_dev;
@@ -81,7 +84,7 @@ sbc_emulate_readcapacity(struct se_cmd *cmd)
 		transport_kunmap_data_sg(cmd);
 	}
 
-	target_complete_cmd(cmd, GOOD);
+	target_complete_cmd_with_length(cmd, GOOD, 8);
 	return 0;
 }
 
@@ -137,7 +140,7 @@ sbc_emulate_readcapacity_16(struct se_cmd *cmd)
 		transport_kunmap_data_sg(cmd);
 	}
 
-	target_complete_cmd(cmd, GOOD);
+	target_complete_cmd_with_length(cmd, GOOD, 32);
 	return 0;
 }
 
@@ -174,24 +177,6 @@ sbc_emulate_noop(struct se_cmd *cmd)
 static inline u32 sbc_get_size(struct se_cmd *cmd, u32 sectors)
 {
 	return cmd->se_dev->dev_attrib.block_size * sectors;
-}
-
-static int sbc_check_valid_sectors(struct se_cmd *cmd)
-{
-	struct se_device *dev = cmd->se_dev;
-	unsigned long long end_lba;
-	u32 sectors;
-
-	sectors = cmd->data_length / dev->dev_attrib.block_size;
-	end_lba = dev->transport->get_blocks(dev) + 1;
-
-	if (cmd->t_task_lba + sectors > end_lba) {
-		pr_err("target: lba %llu, sectors %u exceeds end lba %llu\n",
-			cmd->t_task_lba, sectors, end_lba);
-		return -EINVAL;
-	}
-
-	return 0;
 }
 
 static inline u32 transport_get_sectors_6(unsigned char *cdb)
@@ -269,7 +254,10 @@ static inline unsigned long long transport_lba_64_ext(unsigned char *cdb)
 static sense_reason_t
 sbc_setup_write_same(struct se_cmd *cmd, unsigned char *flags, struct sbc_ops *ops)
 {
+	struct se_device *dev = cmd->se_dev;
+	sector_t end_lba = dev->transport->get_blocks(dev) + 1;
 	unsigned int sectors = sbc_get_write_same_sectors(cmd);
+	sense_reason_t ret;
 
 	if ((flags[0] & 0x04) || (flags[0] & 0x02)) {
 		pr_err("WRITE_SAME PBDATA and LBDATA"
@@ -282,6 +270,16 @@ sbc_setup_write_same(struct se_cmd *cmd, unsigned char *flags, struct sbc_ops *o
 			sectors, cmd->se_dev->dev_attrib.max_write_same_len);
 		return TCM_INVALID_CDB_FIELD;
 	}
+	/*
+	 * Sanity check for LBA wrap and request past end of device.
+	 */
+	if (((cmd->t_task_lba + sectors) < cmd->t_task_lba) ||
+	    ((cmd->t_task_lba + sectors) > end_lba)) {
+		pr_err("WRITE_SAME exceeds last lba %llu (lba %llu, sectors %u)\n",
+		       (unsigned long long)end_lba, cmd->t_task_lba, sectors);
+		return TCM_ADDRESS_OUT_OF_RANGE;
+	}
+
 	/* We always have ANC_SUP == 0 so setting ANCHOR is always an error */
 	if (flags[0] & 0x10) {
 		pr_warn("WRITE SAME with ANCHOR not supported\n");
@@ -295,11 +293,20 @@ sbc_setup_write_same(struct se_cmd *cmd, unsigned char *flags, struct sbc_ops *o
 		if (!ops->execute_write_same_unmap)
 			return TCM_UNSUPPORTED_SCSI_OPCODE;
 
+		if (!dev->dev_attrib.emulate_tpws) {
+			pr_err("Got WRITE_SAME w/ UNMAP=1, but backend device"
+			       " has emulate_tpws disabled\n");
+			return TCM_UNSUPPORTED_SCSI_OPCODE;
+		}
 		cmd->execute_cmd = ops->execute_write_same_unmap;
 		return 0;
 	}
 	if (!ops->execute_write_same)
 		return TCM_UNSUPPORTED_SCSI_OPCODE;
+
+	ret = sbc_check_prot(dev, cmd, &cmd->t_task_cdb[0], sectors, true);
+	if (ret)
+		return ret;
 
 	cmd->execute_cmd = ops->execute_write_same;
 	return 0;
@@ -503,7 +510,7 @@ static sense_reason_t compare_and_write_callback(struct se_cmd *cmd)
 	cmd->t_data_nents_orig = cmd->t_data_nents;
 	cmd->t_data_nents = 1;
 
-	cmd->sam_task_attr = MSG_HEAD_TAG;
+	cmd->sam_task_attr = TCM_HEAD_TAG;
 	cmd->transport_complete_callback = compare_and_write_post;
 	/*
 	 * Now reset ->execute_cmd() to the normal sbc_execute_rw() handler
@@ -632,14 +639,21 @@ sbc_set_prot_op_checks(u8 protect, enum target_prot_type prot_type,
 	return 0;
 }
 
-static bool
+static sense_reason_t
 sbc_check_prot(struct se_device *dev, struct se_cmd *cmd, unsigned char *cdb,
 	       u32 sectors, bool is_write)
 {
 	u8 protect = cdb[1] >> 5;
 
-	if ((!cmd->t_prot_sg || !cmd->t_prot_nents) && cmd->prot_pto)
-		return true;
+	if (!cmd->t_prot_sg || !cmd->t_prot_nents) {
+		if (protect && !dev->dev_attrib.pi_prot_type) {
+			pr_err("CDB contains protect bit, but device does not"
+			       " advertise PROTECT=1 feature bit\n");
+			return TCM_INVALID_CDB_FIELD;
+		}
+		if (cmd->prot_pto)
+			return TCM_NO_SENSE;
+	}
 
 	switch (dev->dev_attrib.pi_prot_type) {
 	case TARGET_DIF_TYPE3_PROT:
@@ -647,7 +661,7 @@ sbc_check_prot(struct se_device *dev, struct se_cmd *cmd, unsigned char *cdb,
 		break;
 	case TARGET_DIF_TYPE2_PROT:
 		if (protect)
-			return false;
+			return TCM_INVALID_CDB_FIELD;
 
 		cmd->reftag_seed = cmd->t_task_lba;
 		break;
@@ -656,20 +670,53 @@ sbc_check_prot(struct se_device *dev, struct se_cmd *cmd, unsigned char *cdb,
 		break;
 	case TARGET_DIF_TYPE0_PROT:
 	default:
-		return true;
+		return TCM_NO_SENSE;
 	}
 
 	if (sbc_set_prot_op_checks(protect, dev->dev_attrib.pi_prot_type,
 				   is_write, cmd))
-		return false;
+		return TCM_INVALID_CDB_FIELD;
 
 	cmd->prot_type = dev->dev_attrib.pi_prot_type;
 	cmd->prot_length = dev->prot_length * sectors;
-	pr_debug("%s: prot_type=%d, prot_length=%d prot_op=%d prot_checks=%d\n",
-		 __func__, cmd->prot_type, cmd->prot_length,
+
+	/**
+	 * In case protection information exists over the wire
+	 * we modify command data length to describe pure data.
+	 * The actual transfer length is data length + protection
+	 * length
+	 **/
+	if (protect)
+		cmd->data_length = sectors * dev->dev_attrib.block_size;
+
+	pr_debug("%s: prot_type=%d, data_length=%d, prot_length=%d "
+		 "prot_op=%d prot_checks=%d\n",
+		 __func__, cmd->prot_type, cmd->data_length, cmd->prot_length,
 		 cmd->prot_op, cmd->prot_checks);
 
-	return true;
+	return TCM_NO_SENSE;
+}
+
+static int
+sbc_check_dpofua(struct se_device *dev, struct se_cmd *cmd, unsigned char *cdb)
+{
+	if (cdb[1] & 0x10) {
+		if (!dev->dev_attrib.emulate_dpo) {
+			pr_err("Got CDB: 0x%02x with DPO bit set, but device"
+			       " does not advertise support for DPO\n", cdb[0]);
+			return -EINVAL;
+		}
+	}
+	if (cdb[1] & 0x8) {
+		if (!dev->dev_attrib.emulate_fua_write || !se_dev_check_wce(dev)) {
+			pr_err("Got CDB: 0x%02x with FUA bit set, but device"
+			       " does not advertise support for FUA write\n",
+			       cdb[0]);
+			return -EINVAL;
+		}
+		cmd->se_cmd_flags |= SCF_FUA;
+	}
+	return 0;
 }
 
 sense_reason_t
@@ -693,8 +740,12 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 		sectors = transport_get_sectors_10(cdb);
 		cmd->t_task_lba = transport_lba_32(cdb);
 
-		if (!sbc_check_prot(dev, cmd, cdb, sectors, false))
-			return TCM_UNSUPPORTED_SCSI_OPCODE;
+		if (sbc_check_dpofua(dev, cmd, cdb))
+			return TCM_INVALID_CDB_FIELD;
+
+		ret = sbc_check_prot(dev, cmd, cdb, sectors, false);
+		if (ret)
+			return ret;
 
 		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
 		cmd->execute_rw = ops->execute_rw;
@@ -704,8 +755,12 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 		sectors = transport_get_sectors_12(cdb);
 		cmd->t_task_lba = transport_lba_32(cdb);
 
-		if (!sbc_check_prot(dev, cmd, cdb, sectors, false))
-			return TCM_UNSUPPORTED_SCSI_OPCODE;
+		if (sbc_check_dpofua(dev, cmd, cdb))
+			return TCM_INVALID_CDB_FIELD;
+
+		ret = sbc_check_prot(dev, cmd, cdb, sectors, false);
+		if (ret)
+			return ret;
 
 		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
 		cmd->execute_rw = ops->execute_rw;
@@ -715,8 +770,12 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 		sectors = transport_get_sectors_16(cdb);
 		cmd->t_task_lba = transport_lba_64(cdb);
 
-		if (!sbc_check_prot(dev, cmd, cdb, sectors, false))
-			return TCM_UNSUPPORTED_SCSI_OPCODE;
+		if (sbc_check_dpofua(dev, cmd, cdb))
+			return TCM_INVALID_CDB_FIELD;
+
+		ret = sbc_check_prot(dev, cmd, cdb, sectors, false);
+		if (ret)
+			return ret;
 
 		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
 		cmd->execute_rw = ops->execute_rw;
@@ -734,11 +793,13 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 		sectors = transport_get_sectors_10(cdb);
 		cmd->t_task_lba = transport_lba_32(cdb);
 
-		if (!sbc_check_prot(dev, cmd, cdb, sectors, true))
-			return TCM_UNSUPPORTED_SCSI_OPCODE;
+		if (sbc_check_dpofua(dev, cmd, cdb))
+			return TCM_INVALID_CDB_FIELD;
 
-		if (cdb[1] & 0x8)
-			cmd->se_cmd_flags |= SCF_FUA;
+		ret = sbc_check_prot(dev, cmd, cdb, sectors, true);
+		if (ret)
+			return ret;
+
 		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
 		cmd->execute_rw = ops->execute_rw;
 		cmd->execute_cmd = sbc_execute_rw;
@@ -747,11 +808,13 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 		sectors = transport_get_sectors_12(cdb);
 		cmd->t_task_lba = transport_lba_32(cdb);
 
-		if (!sbc_check_prot(dev, cmd, cdb, sectors, true))
-			return TCM_UNSUPPORTED_SCSI_OPCODE;
+		if (sbc_check_dpofua(dev, cmd, cdb))
+			return TCM_INVALID_CDB_FIELD;
 
-		if (cdb[1] & 0x8)
-			cmd->se_cmd_flags |= SCF_FUA;
+		ret = sbc_check_prot(dev, cmd, cdb, sectors, true);
+		if (ret)
+			return ret;
+
 		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
 		cmd->execute_rw = ops->execute_rw;
 		cmd->execute_cmd = sbc_execute_rw;
@@ -760,11 +823,13 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 		sectors = transport_get_sectors_16(cdb);
 		cmd->t_task_lba = transport_lba_64(cdb);
 
-		if (!sbc_check_prot(dev, cmd, cdb, sectors, true))
-			return TCM_UNSUPPORTED_SCSI_OPCODE;
+		if (sbc_check_dpofua(dev, cmd, cdb))
+			return TCM_INVALID_CDB_FIELD;
 
-		if (cdb[1] & 0x8)
-			cmd->se_cmd_flags |= SCF_FUA;
+		ret = sbc_check_prot(dev, cmd, cdb, sectors, true);
+		if (ret)
+			return ret;
+
 		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
 		cmd->execute_rw = ops->execute_rw;
 		cmd->execute_cmd = sbc_execute_rw;
@@ -775,6 +840,9 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 			return TCM_INVALID_CDB_FIELD;
 		sectors = transport_get_sectors_10(cdb);
 
+		if (sbc_check_dpofua(dev, cmd, cdb))
+			return TCM_INVALID_CDB_FIELD;
+
 		cmd->t_task_lba = transport_lba_32(cdb);
 		cmd->se_cmd_flags |= SCF_SCSI_DATA_CDB;
 
@@ -784,8 +852,6 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 		cmd->execute_rw = ops->execute_rw;
 		cmd->execute_cmd = sbc_execute_rw;
 		cmd->transport_complete_callback = &xdreadwrite_callback;
-		if (cdb[1] & 0x8)
-			cmd->se_cmd_flags |= SCF_FUA;
 		break;
 	case VARIABLE_LENGTH_CMD:
 	{
@@ -794,6 +860,8 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 		case XDWRITEREAD_32:
 			sectors = transport_get_sectors_32(cdb);
 
+			if (sbc_check_dpofua(dev, cmd, cdb))
+				return TCM_INVALID_CDB_FIELD;
 			/*
 			 * Use WRITE_32 and READ_32 opcodes for the emulated
 			 * XDWRITE_READ_32 logic.
@@ -808,8 +876,6 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 			cmd->execute_rw = ops->execute_rw;
 			cmd->execute_cmd = sbc_execute_rw;
 			cmd->transport_complete_callback = &xdreadwrite_callback;
-			if (cdb[1] & 0x8)
-				cmd->se_cmd_flags |= SCF_FUA;
 			break;
 		case WRITE_SAME_32:
 			sectors = transport_get_sectors_32(cdb);
@@ -859,7 +925,7 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 		size = READ_CAP_LEN;
 		cmd->execute_cmd = sbc_emulate_readcapacity;
 		break;
-	case SERVICE_ACTION_IN:
+	case SERVICE_ACTION_IN_16:
 		switch (cmd->t_task_cdb[1] & 0x1f) {
 		case SAI_READ_CAPACITY_16:
 			cmd->execute_cmd = sbc_emulate_readcapacity_16;
@@ -877,15 +943,6 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 		break;
 	case SYNCHRONIZE_CACHE:
 	case SYNCHRONIZE_CACHE_16:
-		if (!ops->execute_sync_cache) {
-			size = 0;
-			cmd->execute_cmd = sbc_emulate_noop;
-			break;
-		}
-
-		/*
-		 * Extract LBA and range to be flushed for emulated SYNCHRONIZE_CACHE
-		 */
 		if (cdb[0] == SYNCHRONIZE_CACHE) {
 			sectors = transport_get_sectors_10(cdb);
 			cmd->t_task_lba = transport_lba_32(cdb);
@@ -893,23 +950,22 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 			sectors = transport_get_sectors_16(cdb);
 			cmd->t_task_lba = transport_lba_64(cdb);
 		}
-
-		size = sbc_get_size(cmd, sectors);
-
-		/*
-		 * Check to ensure that LBA + Range does not exceed past end of
-		 * device for IBLOCK and FILEIO ->do_sync_cache() backend calls
-		 */
-		if (cmd->t_task_lba || sectors) {
-			if (sbc_check_valid_sectors(cmd) < 0)
-				return TCM_ADDRESS_OUT_OF_RANGE;
+		if (ops->execute_sync_cache) {
+			cmd->execute_cmd = ops->execute_sync_cache;
+			goto check_lba;
 		}
-		cmd->execute_cmd = ops->execute_sync_cache;
+		size = 0;
+		cmd->execute_cmd = sbc_emulate_noop;
 		break;
 	case UNMAP:
 		if (!ops->execute_unmap)
 			return TCM_UNSUPPORTED_SCSI_OPCODE;
 
+		if (!dev->dev_attrib.emulate_tpu) {
+			pr_err("Got UNMAP, but backend device has"
+			       " emulate_tpu disabled\n");
+			return TCM_UNSUPPORTED_SCSI_OPCODE;
+		}
 		size = get_unaligned_be16(&cdb[7]);
 		cmd->execute_cmd = ops->execute_unmap;
 		break;
@@ -947,8 +1003,10 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 		break;
 	case VERIFY:
 		size = 0;
+		sectors = transport_get_sectors_10(cdb);
+		cmd->t_task_lba = transport_lba_32(cdb);
 		cmd->execute_cmd = sbc_emulate_noop;
-		break;
+		goto check_lba;
 	case REZERO_UNIT:
 	case SEEK_6:
 	case SEEK_10:
@@ -968,29 +1026,15 @@ sbc_parse_cdb(struct se_cmd *cmd, struct sbc_ops *ops)
 	}
 
 	/* reject any command that we don't have a handler for */
-	if (!(cmd->se_cmd_flags & SCF_SCSI_DATA_CDB) && !cmd->execute_cmd)
+	if (!cmd->execute_cmd)
 		return TCM_UNSUPPORTED_SCSI_OPCODE;
 
 	if (cmd->se_cmd_flags & SCF_SCSI_DATA_CDB) {
 		unsigned long long end_lba;
-
-		if (sectors > dev->dev_attrib.fabric_max_sectors) {
-			printk_ratelimited(KERN_ERR "SCSI OP %02xh with too"
-				" big sectors %u exceeds fabric_max_sectors:"
-				" %u\n", cdb[0], sectors,
-				dev->dev_attrib.fabric_max_sectors);
-			return TCM_INVALID_CDB_FIELD;
-		}
-		if (sectors > dev->dev_attrib.hw_max_sectors) {
-			printk_ratelimited(KERN_ERR "SCSI OP %02xh with too"
-				" big sectors %u exceeds backend hw_max_sectors:"
-				" %u\n", cdb[0], sectors,
-				dev->dev_attrib.hw_max_sectors);
-			return TCM_INVALID_CDB_FIELD;
-		}
-
+check_lba:
 		end_lba = dev->transport->get_blocks(dev) + 1;
-		if (cmd->t_task_lba + sectors > end_lba) {
+		if (((cmd->t_task_lba + sectors) < cmd->t_task_lba) ||
+		    ((cmd->t_task_lba + sectors) > end_lba)) {
 			pr_err("cmd exceeds last lba %llu "
 				"(lba %llu, sectors %u)\n",
 				end_lba, cmd->t_task_lba, sectors);
